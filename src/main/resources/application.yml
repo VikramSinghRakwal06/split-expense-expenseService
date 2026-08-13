@@ -1,0 +1,169 @@
+spring:
+  application:
+    name: payment-service
+
+  profiles:
+    # Local development is the default; override with SPRING_PROFILES_ACTIVE=prod.
+    default: dev
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/payflow_payment}
+    username: ${DB_USERNAME:payflow}
+    password: ${DB_PASSWORD:payflow}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      pool-name: payment-pool
+      # A transfer takes several short transactions separated by network calls, and the
+      # connection is returned to the pool between them — deliberately, so a slow
+      # wallet-service exhausts sockets rather than the connection pool. Sized for the
+      # number of concurrent transfers, not the number of writes each one makes.
+      maximum-pool-size: ${DB_POOL_MAX:10}
+      minimum-idle: ${DB_POOL_MIN:2}
+      connection-timeout: 30000
+
+  jpa:
+    # Flyway owns the schema. Hibernate only verifies that the mapped entities agree with
+    # the migrated tables and fails fast at startup if they drift. Never `update`: a
+    # schema recording money movements must not change itself.
+    hibernate:
+      ddl-auto: validate
+    # Keeping the persistence context open across view rendering hides lazy-loading bugs
+    # and holds a connection for the whole request. Off, always.
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
+  jackson:
+    default-property-inclusion: non_null
+
+server:
+  port: ${SERVER_PORT:8083}
+  error:
+    # Error bodies are produced by GlobalExceptionHandler; never leak the container's.
+    include-message: never
+    include-stacktrace: never
+
+payflow:
+  jwt:
+    # This service VALIDATES only; it never mints a token. The secret and issuer must match
+    # auth-service exactly, or every request here fails signature verification.
+    secret: ${JWT_SECRET:dev-secret-change-me-this-must-be-at-least-32-bytes-long}
+    issuer: ${JWT_ISSUER:payflow-auth-service}
+
+  auth:
+    # Where this service logs its service account in, to obtain a token for wallet-service.
+    # See ServiceAccountProperties for why a login flow rather than a static token.
+    base-url: ${AUTH_SERVICE_URL:http://localhost:8081}
+    connect-timeout: ${AUTH_CONNECT_TIMEOUT:2s}
+    read-timeout: ${AUTH_READ_TIMEOUT:3s}
+
+  service-account:
+    # Credentials of a pre-provisioned ADMIN account in auth-service, used solely to obtain a
+    # token for wallet-service's internal endpoints. In dev, register this account via
+    # POST /api/v1/auth/register with these exact credentials, then promote it by hand:
+    #   UPDATE users SET role = 'ADMIN' WHERE email = 'payment-service@payflow.internal';
+    email: ${SERVICE_ACCOUNT_EMAIL:payment-service@payflow.internal}
+    password: ${SERVICE_ACCOUNT_PASSWORD:dev-service-account-password-change-me}
+
+  wallet:
+    # wallet-service holds the balances this service moves. Nothing about a transfer is
+    # knowable without it.
+    base-url: ${WALLET_SERVICE_URL:http://localhost:8082}
+
+    # Deliberately short, and deliberately asymmetric. The connect timeout bounds how long
+    # we wait for a socket — a healthy wallet-service answers in single-digit milliseconds,
+    # so 2s already means something is wrong. The read timeout bounds a debit or credit
+    # that has been accepted and is executing; 5s allows for wallet-service's own
+    # optimistic-locking retries on a contended wallet.
+    #
+    # A read timeout is the dangerous case: the request may well have been applied, and we
+    # cannot tell. That is what makes the compensating credit in step 6 mandatory rather
+    # than best-effort.
+    connect-timeout: ${WALLET_CONNECT_TIMEOUT:2s}
+    read-timeout: ${WALLET_READ_TIMEOUT:5s}
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      # One breaker shared by debit and credit: they run against the same service and the
+      # same process, so a failure in either is evidence about both. Separate breakers
+      # would let credit keep hammering a wallet-service that debit has already found down.
+      walletService:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10
+        # Do not judge the service until the window is actually full. Without this a single
+        # early failure reads as a 100% failure rate and opens the breaker on one bad call.
+        minimum-number-of-calls: 10
+        failure-rate-threshold: 50
+        wait-duration-in-open-state: 10s
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+
+        # WHAT COUNTS AS A FAILURE is the most important setting here. Only transport
+        # faults and 5xx — the failures that mean "wallet-service is unwell" — may open the
+        # breaker. A 422 insufficient-funds is a perfectly healthy service giving a correct
+        # answer, and letting business rejections trip the breaker would mean a run of
+        # broke customers takes payments down for everyone.
+        record-exceptions:
+          - com.payflow.payment.exception.WalletServiceUnavailableException
+        ignore-exceptions:
+          - com.payflow.payment.exception.InsufficientFundsException
+          - com.payflow.payment.exception.WalletOperationException
+          - com.payflow.payment.exception.NoWalletException
+
+  retry:
+    instances:
+      walletService:
+        # 3 attempts total, not 3 retries.
+        max-attempts: 3
+        wait-duration: 200ms
+        exponential-backoff-multiplier: 2
+        # Same reasoning as the breaker: retrying an insufficient-funds rejection just
+        # asks the same question twice and gets the same answer, having burned the
+        # caller's latency budget.
+        retry-exceptions:
+          - com.payflow.payment.exception.WalletServiceUnavailableException
+        ignore-exceptions:
+          - com.payflow.payment.exception.InsufficientFundsException
+          - com.payflow.payment.exception.WalletOperationException
+          - com.payflow.payment.exception.NoWalletException
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus,circuitbreakers
+  endpoint:
+    health:
+      show-details: when-authorized
+      probes:
+        enabled: true
+  # NOTE: resilience4j 2.3.0 cannot contribute breaker state to /actuator/health on Boot 4
+  # — its health-indicator autoconfiguration is conditional on classes Boot 4 relocated,
+  # so it is skipped. Breaker state is available from /actuator/circuitbreakers and from
+  # the resilience4j_* Prometheus meters; alert on those, not on the health endpoint.
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operations-sorter: method
+
+logging:
+  level:
+    root: INFO
+    com.payflow.payment: ${LOG_LEVEL:INFO}
