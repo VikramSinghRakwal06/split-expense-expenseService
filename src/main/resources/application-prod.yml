@@ -1,0 +1,53 @@
+# Production profile.
+# No secret and no cross-service address has a usable fallback here: JWT_SECRET, DB_URL,
+# DB_USERNAME, DB_PASSWORD and WALLET_SERVICE_URL must be supplied by the environment or
+# startup fails. A payment service that silently came up pointing at localhost:8082 would
+# be worse than one that did not come up.
+spring:
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: ${DB_POOL_MAX:20}
+      minimum-idle: ${DB_POOL_MIN:5}
+
+  jpa:
+    show-sql: false
+
+  flyway:
+    # Never allow a running service to drop the schema it depends on.
+    clean-disabled: true
+
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
+
+payflow:
+  jwt:
+    secret: ${JWT_SECRET}
+
+  auth:
+    base-url: ${AUTH_SERVICE_URL}
+
+  service-account:
+    email: ${SERVICE_ACCOUNT_EMAIL}
+    password: ${SERVICE_ACCOUNT_PASSWORD}
+
+  wallet:
+    base-url: ${WALLET_SERVICE_URL}
+
+management:
+  endpoint:
+    health:
+      show-details: when-authorized
+
+springdoc:
+  swagger-ui:
+    # The interactive UI is not exposed in production; /v3/api-docs still is, so gateways
+    # and client generators can consume the contract.
+    enabled: ${SWAGGER_UI_ENABLED:false}
+
+logging:
+  level:
+    root: WARN
+    com.payflow.payment: ${LOG_LEVEL:INFO}
