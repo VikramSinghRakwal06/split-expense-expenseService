@@ -7,6 +7,7 @@ import com.payflow.payment.dto.response.TransactionResponse;
 import com.payflow.payment.entity.IdempotencyRecord;
 import com.payflow.payment.entity.Transaction;
 import com.payflow.payment.entity.TransactionStatus;
+import com.payflow.payment.event.PaymentEventPublisher;
 import com.payflow.payment.exception.IdempotencyKeyConflictException;
 import com.payflow.payment.exception.InsufficientFundsException;
 import com.payflow.payment.exception.SameWalletTransferException;
@@ -79,6 +80,7 @@ public class PaymentService {
     private final AuditService auditService;
     private final TransactionMapper transactionMapper;
     private final ObjectMapper objectMapper;
+    private final PaymentEventPublisher paymentEventPublisher;
 
     public PaymentService(
             TransactionRepository transactionRepository,
@@ -86,13 +88,15 @@ public class PaymentService {
             WalletClient walletClient,
             AuditService auditService,
             TransactionMapper transactionMapper,
-            ObjectMapper objectMapper) {
+            ObjectMapper objectMapper,
+            PaymentEventPublisher paymentEventPublisher) {
         this.transactionRepository = transactionRepository;
         this.idempotencyRecordRepository = idempotencyRecordRepository;
         this.walletClient = walletClient;
         this.auditService = auditService;
         this.transactionMapper = transactionMapper;
         this.objectMapper = objectMapper;
+        this.paymentEventPublisher = paymentEventPublisher;
     }
 
     /**
@@ -149,7 +153,7 @@ public class PaymentService {
                     requestHash);
         }
 
-        return execute(idempotencyKey, senderWalletId, request, record);
+        return execute(idempotencyKey, senderWalletId, senderWallet.userId(), request, record);
     }
 
     /**
@@ -199,6 +203,7 @@ public class PaymentService {
     private TransactionResponse execute(
             String idempotencyKey,
             UUID senderWalletId,
+            UUID senderUserId,
             TransferRequest request,
             IdempotencyRecord idempotencyRecord) {
 
@@ -229,6 +234,7 @@ public class PaymentService {
         } catch (InsufficientFundsException | WalletOperationException ex) {
             markTerminal(txn, TransactionStatus.FAILED, ex.getMessage());
             auditService.record(txn.getId(), "DEBIT_REFUSED", ex.getMessage());
+            paymentEventPublisher.publishFailed(txn.getId(), senderUserId, request.amount(), ex.getMessage());
             throw new TransferFailedException(ex.getMessage());
         } catch (WalletServiceUnavailableException ex) {
             // See the class javadoc's "Known limitation" section. Left INITIATED, not FAILED.
@@ -236,18 +242,21 @@ public class PaymentService {
             throw ex;
         }
 
-        markStatus(txn, TransactionStatus.DEBITED);
+        txn = markStatus(txn, TransactionStatus.DEBITED);
         auditService.record(txn.getId(), "SENDER_DEBITED", "amount=" + request.amount());
 
+        WalletBalanceView receiverWallet;
         try {
-            walletClient.credit(request.receiverWalletId(), request.amount(), reference,
+            receiverWallet = walletClient.credit(request.receiverWalletId(), request.amount(), reference,
                     "Transfer from wallet " + senderWalletId);
         } catch (WalletOperationException | WalletServiceUnavailableException ex) {
-            throw reverse(txn, ex);
+            throw reverse(txn, senderUserId, ex);
         }
 
-        markTerminal(txn, TransactionStatus.COMPLETED, null);
+        txn = markTerminal(txn, TransactionStatus.COMPLETED, null);
         auditService.record(txn.getId(), "TRANSFER_COMPLETED", "amount=" + request.amount());
+        paymentEventPublisher.publishCompleted(
+                txn.getId(), senderUserId, receiverWallet.userId(), txn.getAmount(), txn.getCurrency());
 
         TransactionResponse response = transactionMapper.toResponse(txn);
         cacheSuccess(idempotencyRecord, response);
@@ -260,7 +269,7 @@ public class PaymentService {
      *
      * @return the exception {@link #execute} should throw — never returns normally
      */
-    private RuntimeException reverse(Transaction txn, RuntimeException creditFailure) {
+    private RuntimeException reverse(Transaction txn, UUID senderUserId, RuntimeException creditFailure) {
         auditService.record(txn.getId(), "CREDIT_FAILED", creditFailure.getMessage());
 
         try {
@@ -274,24 +283,35 @@ public class PaymentService {
                             + "reversal credit also failed. Manual reconciliation required.",
                     txn.getId(), compensationFailure);
             auditService.record(txn.getId(), "COMPENSATION_FAILED", compensationFailure.getMessage());
-            // Status deliberately stays DEBITED: this is not a settled outcome.
+            // Status deliberately stays DEBITED: this is not a settled outcome, so no
+            // PaymentFailedEvent either — nothing has actually failed yet, as far as we know.
             return new TransferUnresolvedException(txn.getId());
         }
 
-        markTerminal(txn, TransactionStatus.REVERSED, creditFailure.getMessage());
+        txn = markTerminal(txn, TransactionStatus.REVERSED, creditFailure.getMessage());
         auditService.record(txn.getId(), "TRANSFER_REVERSED", creditFailure.getMessage());
+        paymentEventPublisher.publishFailed(
+                txn.getId(), senderUserId, txn.getAmount(), creditFailure.getMessage());
         return new TransferReversedException(creditFailure.getMessage());
     }
 
-    private void markStatus(Transaction txn, TransactionStatus status) {
+    /**
+     * Each {@code save} here is its own already-committed transaction (see the class javadoc),
+     * so by the time it returns {@code txn} is detached and {@code save} took the
+     * {@code merge()} path — which returns a distinct, newly-managed instance carrying the
+     * bumped {@code @Version}, leaving the original instance's version stale. Callers MUST use
+     * the returned entity for any further save, or that next save's version check fails
+     * against a version the database has already moved past.
+     */
+    private Transaction markStatus(Transaction txn, TransactionStatus status) {
         txn.setStatus(status);
-        transactionRepository.save(txn);
+        return transactionRepository.save(txn);
     }
 
-    private void markTerminal(Transaction txn, TransactionStatus status, String failureReason) {
+    private Transaction markTerminal(Transaction txn, TransactionStatus status, String failureReason) {
         txn.setStatus(status);
         txn.setFailureReason(failureReason);
-        transactionRepository.save(txn);
+        return transactionRepository.save(txn);
     }
 
     private void cacheSuccess(IdempotencyRecord record, TransactionResponse response) {

@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -16,6 +17,7 @@ import com.payflow.payment.dto.response.TransactionResponse;
 import com.payflow.payment.entity.IdempotencyRecord;
 import com.payflow.payment.entity.Transaction;
 import com.payflow.payment.entity.TransactionStatus;
+import com.payflow.payment.event.PaymentEventPublisher;
 import com.payflow.payment.exception.IdempotencyKeyConflictException;
 import com.payflow.payment.exception.InsufficientFundsException;
 import com.payflow.payment.exception.SameWalletTransferException;
@@ -73,6 +75,7 @@ class PaymentServiceTest {
     @Mock private WalletClient walletClient;
     @Mock private AuditService auditService;
     @Mock private ObjectMapper objectMapper;
+    @Mock private PaymentEventPublisher paymentEventPublisher;
 
     private PaymentService service;
 
@@ -84,7 +87,14 @@ class PaymentServiceTest {
                 walletClient,
                 auditService,
                 new TransactionMapper(),
-                objectMapper);
+                objectMapper,
+                paymentEventPublisher);
+
+        // markStatus/markTerminal rely on save()'s return value carrying the bumped @Version
+        // forward (see their javadoc); echoing the argument back keeps that contract true for
+        // tests without asserting on version numbers specifically. lenient: not every test
+        // reaches a save() call.
+        lenient().when(transactionRepository.save(any())).thenAnswer(inv -> inv.getArgument(0));
     }
 
     private static WalletBalanceView walletView(UUID walletId) {

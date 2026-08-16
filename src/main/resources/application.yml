@@ -42,6 +42,11 @@ spring:
 
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    producer:
+      # Matches notification-service's own producer (used there for its DLT): the same
+      # Jackson-based serializer on both sides of the platform.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JacksonJsonSerializer
 
   jackson:
     default-property-inclusion: non_null
