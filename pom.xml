@@ -8,11 +8,11 @@
 		<version>4.1.0</version>
 		<relativePath/> <!-- lookup parent from repository -->
 	</parent>
-	<groupId>com.payflow</groupId>
-	<artifactId>payment-service</artifactId>
+	<groupId>com.splitexpense</groupId>
+	<artifactId>expense-service</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name>payment-service</name>
-	<description>PayFlow payment orchestration: idempotent transfers between wallets</description>
+	<name>expense-service</name>
+	<description>SplitExpense expense service: splits, settlements and the expense saga</description>
 
 	<properties>
 		<java.version>21</java.version>

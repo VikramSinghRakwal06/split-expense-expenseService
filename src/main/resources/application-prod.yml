@@ -1,7 +1,7 @@
 # Production profile.
 # No secret and no cross-service address has a usable fallback here: JWT_SECRET, DB_URL,
-# DB_USERNAME, DB_PASSWORD and WALLET_SERVICE_URL must be supplied by the environment or
-# startup fails. A payment service that silently came up pointing at localhost:8082 would
+# DB_USERNAME, DB_PASSWORD and GROUP_SERVICE_URL must be supplied by the environment or
+# startup fails. An expense service that silently came up pointing at localhost:8082 would
 # be worse than one that did not come up.
 spring:
   datasource:
@@ -22,7 +22,7 @@ spring:
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS}
 
-payflow:
+splitexpense:
   jwt:
     secret: ${JWT_SECRET}
 
@@ -33,8 +33,8 @@ payflow:
     email: ${SERVICE_ACCOUNT_EMAIL}
     password: ${SERVICE_ACCOUNT_PASSWORD}
 
-  wallet:
-    base-url: ${WALLET_SERVICE_URL}
+  group:
+    base-url: ${GROUP_SERVICE_URL}
 
 management:
   endpoint:
@@ -50,4 +50,4 @@ springdoc:
 logging:
   level:
     root: WARN
-    com.payflow.payment: ${LOG_LEVEL:INFO}
+    com.splitexpense.expense: ${LOG_LEVEL:INFO}
