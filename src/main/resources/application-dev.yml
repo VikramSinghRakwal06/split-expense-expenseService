@@ -1,6 +1,6 @@
 # Local development profile.
 # Every value still resolves from an env var first, so a developer can point at a different
-# database or a wallet-service running elsewhere without editing this file.
+# database or a group-service running elsewhere without editing this file.
 spring:
   jpa:
     show-sql: ${JPA_SHOW_SQL:true}
@@ -23,8 +23,8 @@ springdoc:
 
 logging:
   level:
-    com.payflow.payment: ${LOG_LEVEL:DEBUG}
+    com.splitexpense.expense: ${LOG_LEVEL:DEBUG}
     org.springframework.security: INFO
-    # Makes breaker state changes and retry attempts against wallet-service visible while
+    # Makes breaker state changes and retry attempts against group-service visible while
     # working on the saga.
     io.github.resilience4j: DEBUG

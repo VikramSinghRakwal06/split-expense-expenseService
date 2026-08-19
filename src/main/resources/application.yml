@@ -1,30 +1,30 @@
 spring:
   application:
-    name: payment-service
+    name: expense-service
 
   profiles:
     # Local development is the default; override with SPRING_PROFILES_ACTIVE=prod.
     default: dev
 
   datasource:
-    url: ${DB_URL:jdbc:postgresql://localhost:5432/payflow_payment}
-    username: ${DB_USERNAME:payflow}
-    password: ${DB_PASSWORD:payflow}
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/splitexpense_expense}
+    username: ${DB_USERNAME:splitexpense}
+    password: ${DB_PASSWORD:splitexpense}
     driver-class-name: org.postgresql.Driver
     hikari:
-      pool-name: payment-pool
-      # A transfer takes several short transactions separated by network calls, and the
-      # connection is returned to the pool between them — deliberately, so a slow
-      # wallet-service exhausts sockets rather than the connection pool. Sized for the
-      # number of concurrent transfers, not the number of writes each one makes.
+      pool-name: expense-pool
+      # An expense or settlement takes several short transactions separated by network calls,
+      # and the connection is returned to the pool between them — deliberately, so a slow
+      # group-service exhausts sockets rather than the connection pool. Sized for the number
+      # of concurrent operations, not the number of writes each one makes.
       maximum-pool-size: ${DB_POOL_MAX:10}
       minimum-idle: ${DB_POOL_MIN:2}
       connection-timeout: 30000
 
   jpa:
     # Flyway owns the schema. Hibernate only verifies that the mapped entities agree with
-    # the migrated tables and fails fast at startup if they drift. Never `update`: a
-    # schema recording money movements must not change itself.
+    # the migrated tables and fails fast at startup if they drift. Never `update`: a schema
+    # recording expenses and settlements must not change itself.
     hibernate:
       ddl-auto: validate
     # Keeping the persistence context open across view rendering hides lazy-loading bugs
@@ -58,15 +58,15 @@ server:
     include-message: never
     include-stacktrace: never
 
-payflow:
+splitexpense:
   jwt:
     # This service VALIDATES only; it never mints a token. The secret and issuer must match
     # auth-service exactly, or every request here fails signature verification.
     secret: ${JWT_SECRET:dev-secret-change-me-this-must-be-at-least-32-bytes-long}
-    issuer: ${JWT_ISSUER:payflow-auth-service}
+    issuer: ${JWT_ISSUER:splitexpense-auth-service}
 
   auth:
-    # Where this service logs its service account in, to obtain a token for wallet-service.
+    # Where this service logs its service account in, to obtain a token for group-service.
     # See ServiceAccountProperties for why a login flow rather than a static token.
     base-url: ${AUTH_SERVICE_URL:http://localhost:8081}
     connect-timeout: ${AUTH_CONNECT_TIMEOUT:2s}
@@ -74,36 +74,35 @@ payflow:
 
   service-account:
     # Credentials of a pre-provisioned ADMIN account in auth-service, used solely to obtain a
-    # token for wallet-service's internal endpoints. In dev, register this account via
+    # token for group-service's internal endpoints. In dev, register this account via
     # POST /api/v1/auth/register with these exact credentials, then promote it by hand:
-    #   UPDATE users SET role = 'ADMIN' WHERE email = 'payment-service@payflow.internal';
-    email: ${SERVICE_ACCOUNT_EMAIL:payment-service@payflow.internal}
+    #   UPDATE users SET role = 'ADMIN' WHERE email = 'expense-service@splitexpense.internal';
+    email: ${SERVICE_ACCOUNT_EMAIL:expense-service@splitexpense.internal}
     password: ${SERVICE_ACCOUNT_PASSWORD:dev-service-account-password-change-me}
 
-  wallet:
-    # wallet-service holds the balances this service moves. Nothing about a transfer is
-    # knowable without it.
-    base-url: ${WALLET_SERVICE_URL:http://localhost:8082}
+  group:
+    # group-service holds the debt graph this service applies deltas to. Nothing about an
+    # expense's effect on balances is knowable without it.
+    base-url: ${GROUP_SERVICE_URL:http://localhost:8082}
 
-    # Deliberately short, and deliberately asymmetric. The connect timeout bounds how long
-    # we wait for a socket — a healthy wallet-service answers in single-digit milliseconds,
-    # so 2s already means something is wrong. The read timeout bounds a debit or credit
-    # that has been accepted and is executing; 5s allows for wallet-service's own
-    # optimistic-locking retries on a contended wallet.
+    # Deliberately short, and deliberately asymmetric. The connect timeout bounds how long we
+    # wait for a socket — a healthy group-service answers in single-digit milliseconds, so 2s
+    # already means something is wrong. The read timeout bounds an apply that has been
+    # accepted and is executing; 5s allows for group-service's own optimistic-locking
+    # retries on a contended group.
     #
-    # A read timeout is the dangerous case: the request may well have been applied, and we
-    # cannot tell. That is what makes the compensating credit in step 6 mandatory rather
-    # than best-effort.
-    connect-timeout: ${WALLET_CONNECT_TIMEOUT:2s}
-    read-timeout: ${WALLET_READ_TIMEOUT:5s}
+    # Unlike the wallet-service client this replaces, a read timeout here is not dangerous:
+    # group-service's :apply endpoint is idempotent by this service's own reference id, so an
+    # ambiguous outcome costs a retry, never a compensation.
+    connect-timeout: ${GROUP_CONNECT_TIMEOUT:2s}
+    read-timeout: ${GROUP_READ_TIMEOUT:5s}
 
 resilience4j:
   circuitbreaker:
     instances:
-      # One breaker shared by debit and credit: they run against the same service and the
-      # same process, so a failure in either is evidence about both. Separate breakers
-      # would let credit keep hammering a wallet-service that debit has already found down.
-      walletService:
+      # One breaker for every call onto group-service: reads and applies run against the same
+      # service and the same process, so a failure in either is evidence about both.
+      groupService:
         sliding-window-type: COUNT_BASED
         sliding-window-size: 10
         # Do not judge the service until the window is actually full. Without this a single
@@ -114,34 +113,31 @@ resilience4j:
         permitted-number-of-calls-in-half-open-state: 3
         automatic-transition-from-open-to-half-open-enabled: true
 
-        # WHAT COUNTS AS A FAILURE is the most important setting here. Only transport
-        # faults and 5xx — the failures that mean "wallet-service is unwell" — may open the
-        # breaker. A 422 insufficient-funds is a perfectly healthy service giving a correct
-        # answer, and letting business rejections trip the breaker would mean a run of
-        # broke customers takes payments down for everyone.
+        # WHAT COUNTS AS A FAILURE is the most important setting here. Only transport faults
+        # and 5xx — the failures that mean "group-service is unwell" — may open the breaker.
+        # A 422 non-member rejection is a perfectly healthy service giving a correct answer,
+        # and letting business rejections trip the breaker would mean a run of malformed
+        # expenses takes expense recording down for everyone.
         record-exceptions:
-          - com.payflow.payment.exception.WalletServiceUnavailableException
+          - com.splitexpense.expense.exception.GroupServiceUnavailableException
         ignore-exceptions:
-          - com.payflow.payment.exception.InsufficientFundsException
-          - com.payflow.payment.exception.WalletOperationException
-          - com.payflow.payment.exception.NoWalletException
+          - com.splitexpense.expense.exception.GroupOperationException
+          - com.splitexpense.expense.exception.NoSuchGroupException
 
   retry:
     instances:
-      walletService:
+      groupService:
         # 3 attempts total, not 3 retries.
         max-attempts: 3
         wait-duration: 200ms
         exponential-backoff-multiplier: 2
-        # Same reasoning as the breaker: retrying an insufficient-funds rejection just
-        # asks the same question twice and gets the same answer, having burned the
-        # caller's latency budget.
+        # Same reasoning as the breaker: retrying a business rejection just asks the same
+        # question twice and gets the same answer, having burned the caller's latency budget.
         retry-exceptions:
-          - com.payflow.payment.exception.WalletServiceUnavailableException
+          - com.splitexpense.expense.exception.GroupServiceUnavailableException
         ignore-exceptions:
-          - com.payflow.payment.exception.InsufficientFundsException
-          - com.payflow.payment.exception.WalletOperationException
-          - com.payflow.payment.exception.NoWalletException
+          - com.splitexpense.expense.exception.GroupOperationException
+          - com.splitexpense.expense.exception.NoSuchGroupException
 
 management:
   endpoints:
@@ -153,10 +149,10 @@ management:
       show-details: when-authorized
       probes:
         enabled: true
-  # NOTE: resilience4j 2.3.0 cannot contribute breaker state to /actuator/health on Boot 4
-  # — its health-indicator autoconfiguration is conditional on classes Boot 4 relocated,
-  # so it is skipped. Breaker state is available from /actuator/circuitbreakers and from
-  # the resilience4j_* Prometheus meters; alert on those, not on the health endpoint.
+  # NOTE: resilience4j 2.3.0 cannot contribute breaker state to /actuator/health on Boot 4 —
+  # its health-indicator autoconfiguration is conditional on classes Boot 4 relocated, so it
+  # is skipped. Breaker state is available from /actuator/circuitbreakers and from the
+  # resilience4j_* Prometheus meters; alert on those, not on the health endpoint.
   metrics:
     tags:
       application: ${spring.application.name}
@@ -171,4 +167,4 @@ springdoc:
 logging:
   level:
     root: INFO
-    com.payflow.payment: ${LOG_LEVEL:INFO}
+    com.splitexpense.expense: ${LOG_LEVEL:INFO}
